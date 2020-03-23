@@ -105,11 +105,14 @@ import { isLinearElement } from "../element/typeChecks";
 import { rescalePoints } from "../points";
 import { actionFinalize } from "../actions";
 
+/**
+ * @param func handler taking at most single parameter (event).
+ */
 function withBatchedUpdates<
   TFunction extends ((event: any) => void) | (() => void)
->(func: TFunction) {
+>(func: Parameters<TFunction>["length"] extends 0 | 1 ? TFunction : never) {
   return (event => {
-    unstable_batchedUpdates(func, event);
+    unstable_batchedUpdates(func as TFunction, event);
   }) as TFunction;
 }
 
@@ -164,30 +167,315 @@ export class App extends React.Component<any, AppState> {
     this.actionManager.registerAction(createRedoAction(history));
   }
 
-  private syncActionResult = withBatchedUpdates(
-    (res: ActionResult, commitToHistory: boolean = true) => {
-      if (this.unmounted) {
+  public render() {
+    const canvasDOMWidth = window.innerWidth;
+    const canvasDOMHeight = window.innerHeight;
+
+    const canvasScale = window.devicePixelRatio;
+
+    const canvasWidth = canvasDOMWidth * canvasScale;
+    const canvasHeight = canvasDOMHeight * canvasScale;
+
+    return (
+      <div className="container">
+        <LayerUI
+          canvas={this.canvas}
+          appState={this.state}
+          setAppState={this.setAppState}
+          actionManager={this.actionManager}
+          elements={globalSceneState.getAllElements().filter(element => {
+            return !element.isDeleted;
+          })}
+          setElements={this.setElements}
+          language={getLanguage()}
+          onRoomCreate={this.createRoom}
+          onRoomDestroy={this.destroyRoom}
+          onToggleLock={this.toggleLock}
+        />
+        <main>
+          <canvas
+            id="canvas"
+            style={{
+              width: canvasDOMWidth,
+              height: canvasDOMHeight,
+            }}
+            width={canvasWidth}
+            height={canvasHeight}
+            ref={canvas => {
+              // canvas is null when unmounting
+              if (canvas !== null) {
+                this.canvas = canvas;
+                this.rc = rough.canvas(this.canvas);
+
+                this.canvas.addEventListener("wheel", this.handleWheel, {
+                  passive: false,
+                });
+              } else {
+                this.canvas?.removeEventListener("wheel", this.handleWheel);
+              }
+            }}
+            onContextMenu={this.handleCanvasContextMenu}
+            onPointerDown={this.handleCanvasPointerDown}
+            onDoubleClick={this.handleCanvasDoubleClick}
+            onPointerMove={this.handleCanvasPointerMove}
+            onPointerUp={this.removePointer}
+            onPointerCancel={this.removePointer}
+            onDrop={event => {
+              const file = event.dataTransfer.files[0];
+              if (
+                file?.type === "application/json" ||
+                file?.name.endsWith(".excalidraw")
+              ) {
+                loadFromBlob(file)
+                  .then(({ elements, appState }) =>
+                    this.syncActionResult({
+                      elements,
+                      appState,
+                      commitToHistory: false,
+                    }),
+                  )
+                  .catch(error => console.error(error));
+              }
+            }}
+          >
+            {t("labels.drawingCanvas")}
+          </canvas>
+        </main>
+      </div>
+    );
+  }
+
+  private syncActionResult = withBatchedUpdates((res: ActionResult) => {
+    if (this.unmounted) {
+      return;
+    }
+    if (res.elements) {
+      globalSceneState.replaceAllElements(res.elements);
+      if (res.commitToHistory) {
+        history.resumeRecording();
+      }
+    }
+
+    if (res.appState) {
+      if (res.commitToHistory) {
+        history.resumeRecording();
+      }
+      this.setState(state => ({
+        ...res.appState,
+        isCollaborating: state.isCollaborating,
+        collaborators: state.collaborators,
+      }));
+    }
+  });
+
+  // Lifecycle
+
+  private onUnload = withBatchedUpdates(() => {
+    isHoldingSpace = false;
+    this.saveDebounced();
+    this.saveDebounced.flush();
+  });
+
+  private disableEvent: EventHandlerNonNull = event => {
+    event.preventDefault();
+  };
+  private unmounted = false;
+
+  public async componentDidMount() {
+    if (
+      process.env.NODE_ENV === "test" ||
+      process.env.NODE_ENV === "development"
+    ) {
+      const setState = this.setState.bind(this);
+      Object.defineProperties(window.h, {
+        state: {
+          configurable: true,
+          get: () => {
+            return this.state;
+          },
+        },
+        setState: {
+          configurable: true,
+          value: (...args: Parameters<typeof setState>) => {
+            return this.setState(...args);
+          },
+        },
+      });
+    }
+
+    this.removeSceneCallback = globalSceneState.addCallback(
+      this.onSceneUpdated,
+    );
+
+    document.addEventListener("copy", this.onCopy);
+    document.addEventListener("paste", this.pasteFromClipboard);
+    document.addEventListener("cut", this.onCut);
+
+    document.addEventListener("keydown", this.onKeyDown, false);
+    document.addEventListener("keyup", this.onKeyUp, { passive: true });
+    document.addEventListener("mousemove", this.updateCurrentCursorPosition);
+    window.addEventListener("resize", this.onResize, false);
+    window.addEventListener("unload", this.onUnload, false);
+    window.addEventListener("blur", this.onUnload, false);
+    window.addEventListener("dragover", this.disableEvent, false);
+    window.addEventListener("drop", this.disableEvent, false);
+
+    // Safari-only desktop pinch zoom
+    document.addEventListener(
+      "gesturestart",
+      this.onGestureStart as any,
+      false,
+    );
+    document.addEventListener(
+      "gesturechange",
+      this.onGestureChange as any,
+      false,
+    );
+    document.addEventListener("gestureend", this.onGestureEnd as any, false);
+
+    const searchParams = new URLSearchParams(window.location.search);
+    const id = searchParams.get("id");
+
+    if (id) {
+      // Backwards compatibility with legacy url format
+      const scene = await loadScene(id);
+      this.syncActionResult(scene);
+    }
+
+    const jsonMatch = window.location.hash.match(
+      /^#json=([0-9]+),([a-zA-Z0-9_-]+)$/,
+    );
+    if (jsonMatch) {
+      const scene = await loadScene(jsonMatch[1], jsonMatch[2]);
+      this.syncActionResult(scene);
+      return;
+    }
+
+    const scene = await loadScene(null);
+    this.syncActionResult(scene);
+
+    const roomMatch = getCollaborationLinkData(window.location.href);
+    if (roomMatch) {
+      this.initializeSocketClient();
+      return;
+    }
+
+    window.addEventListener("beforeunload", this.beforeUnload);
+  }
+
+  public componentWillUnmount() {
+    this.unmounted = true;
+    this.removeSceneCallback!();
+
+    document.removeEventListener("copy", this.onCopy);
+    document.removeEventListener("paste", this.pasteFromClipboard);
+    document.removeEventListener("cut", this.onCut);
+
+    document.removeEventListener("keydown", this.onKeyDown, false);
+    document.removeEventListener(
+      "mousemove",
+      this.updateCurrentCursorPosition,
+      false,
+    );
+    document.removeEventListener("keyup", this.onKeyUp);
+    window.removeEventListener("resize", this.onResize, false);
+    window.removeEventListener("unload", this.onUnload, false);
+    window.removeEventListener("blur", this.onUnload, false);
+    window.removeEventListener("dragover", this.disableEvent, false);
+    window.removeEventListener("drop", this.disableEvent, false);
+
+    document.removeEventListener(
+      "gesturestart",
+      this.onGestureStart as any,
+      false,
+    );
+    document.removeEventListener(
+      "gesturechange",
+      this.onGestureChange as any,
+      false,
+    );
+    document.removeEventListener("gestureend", this.onGestureEnd as any, false);
+    window.removeEventListener("beforeunload", this.beforeUnload);
+  }
+  private onResize = withBatchedUpdates(() => {
+    globalSceneState
+      .getAllElements()
+      .forEach(element => invalidateShapeForElement(element));
+    this.setState({});
+  });
+
+  private beforeUnload = withBatchedUpdates((event: BeforeUnloadEvent) => {
+    if (
+      this.state.isCollaborating &&
+      hasNonDeletedElements(globalSceneState.getAllElements())
+    ) {
+      event.preventDefault();
+      // NOTE: modern browsers no longer allow showing a custom message here
+      event.returnValue = "";
+    }
+  });
+
+  componentDidUpdate() {
+    if (this.state.isCollaborating && !this.socket) {
+      this.initializeSocketClient();
+    }
+    const pointerViewportCoords: {
+      [id: string]: { x: number; y: number };
+    } = {};
+    this.state.collaborators.forEach((user, socketID) => {
+      if (!user.pointer) {
         return;
       }
-      if (res.elements) {
-        globalSceneState.replaceAllElements(res.elements);
-        if (commitToHistory) {
-          history.resumeRecording();
-        }
-      }
+      pointerViewportCoords[socketID] = sceneCoordsToViewportCoords(
+        {
+          sceneX: user.pointer.x,
+          sceneY: user.pointer.y,
+        },
+        this.state,
+        this.canvas,
+        window.devicePixelRatio,
+      );
+    });
+    const { atLeastOneVisibleElement, scrollBars } = renderScene(
+      globalSceneState.getAllElements(),
+      this.state,
+      this.state.selectionElement,
+      window.devicePixelRatio,
+      this.rc!,
+      this.canvas!,
+      {
+        scrollX: this.state.scrollX,
+        scrollY: this.state.scrollY,
+        viewBackgroundColor: this.state.viewBackgroundColor,
+        zoom: this.state.zoom,
+        remotePointerViewportCoords: pointerViewportCoords,
+      },
+      {
+        renderOptimizations: true,
+      },
+    );
+    if (scrollBars) {
+      currentScrollBars = scrollBars;
+    }
+    const scrolledOutside =
+      !atLeastOneVisibleElement &&
+      hasNonDeletedElements(globalSceneState.getAllElements());
+    if (this.state.scrolledOutside !== scrolledOutside) {
+      this.setState({ scrolledOutside: scrolledOutside });
+    }
+    this.saveDebounced();
 
-      if (res.appState) {
-        if (commitToHistory) {
-          history.resumeRecording();
-        }
-        this.setState(state => ({
-          ...res.appState,
-          isCollaborating: state.isCollaborating,
-          collaborators: state.collaborators,
-        }));
-      }
-    },
-  );
+    if (
+      getDrawingVersion(globalSceneState.getAllElements()) >
+      this.lastBroadcastedOrReceivedSceneVersion
+    ) {
+      this.broadcastSceneUpdate();
+    }
+
+    history.record(this.state, globalSceneState.getAllElements());
+  }
+
+  // Copy/paste
 
   private onCut = withBatchedUpdates((event: ClipboardEvent) => {
     if (isWritableElement(event.target)) {
@@ -211,15 +499,144 @@ export class App extends React.Component<any, AppState> {
     copyToAppClipboard(globalSceneState.getAllElements(), this.state);
     event.preventDefault();
   });
+  private copyToAppClipboard = () => {
+    copyToAppClipboard(globalSceneState.getAllElements(), this.state);
+  };
 
-  private onUnload = withBatchedUpdates(() => {
-    isHoldingSpace = false;
-    this.saveDebounced();
-    this.saveDebounced.flush();
-  });
+  private copyToClipboardAsPng = () => {
+    const selectedElements = getSelectedElements(
+      globalSceneState.getAllElements(),
+      this.state,
+    );
+    exportCanvas(
+      "clipboard",
+      selectedElements.length
+        ? selectedElements
+        : globalSceneState.getAllElements(),
+      this.state,
+      this.canvas!,
+      this.state,
+    );
+  };
 
-  private disableEvent: EventHandlerNonNull = event => {
-    event.preventDefault();
+  private pasteFromClipboard = withBatchedUpdates(
+    async (event: ClipboardEvent | null) => {
+      // #686
+      const target = document.activeElement;
+      const elementUnderCursor = document.elementFromPoint(cursorX, cursorY);
+      if (
+        // if no ClipboardEvent supplied, assume we're pasting via contextMenu
+        //  thus these checks don't make sense
+        !event ||
+        (elementUnderCursor instanceof HTMLCanvasElement &&
+          !isWritableElement(target))
+      ) {
+        const data = await getClipboardContent(event);
+        if (data.elements) {
+          this.addElementsFromPaste(data.elements);
+        } else if (data.text) {
+          const { x, y } = viewportCoordsToSceneCoords(
+            { clientX: cursorX, clientY: cursorY },
+            this.state,
+            this.canvas,
+            window.devicePixelRatio,
+          );
+
+          const element = newTextElement({
+            x: x,
+            y: y,
+            strokeColor: this.state.currentItemStrokeColor,
+            backgroundColor: this.state.currentItemBackgroundColor,
+            fillStyle: this.state.currentItemFillStyle,
+            strokeWidth: this.state.currentItemStrokeWidth,
+            roughness: this.state.currentItemRoughness,
+            opacity: this.state.currentItemOpacity,
+            text: data.text,
+            font: this.state.currentItemFont,
+          });
+
+          globalSceneState.replaceAllElements([
+            ...globalSceneState.getAllElements(),
+            element,
+          ]);
+          this.setState({ selectedElementIds: { [element.id]: true } });
+          history.resumeRecording();
+        }
+        this.selectShapeTool("selection");
+        event?.preventDefault();
+      }
+    },
+  );
+
+  private addElementsFromPaste = (
+    clipboardElements: readonly ExcalidrawElement[],
+  ) => {
+    const [minX, minY, maxX, maxY] = getCommonBounds(clipboardElements);
+
+    const elementsCenterX = distance(minX, maxX) / 2;
+    const elementsCenterY = distance(minY, maxY) / 2;
+
+    const { x, y } = viewportCoordsToSceneCoords(
+      { clientX: cursorX, clientY: cursorY },
+      this.state,
+      this.canvas,
+      window.devicePixelRatio,
+    );
+
+    const dx = x - elementsCenterX;
+    const dy = y - elementsCenterY;
+
+    const newElements = clipboardElements.map(element =>
+      duplicateElement(element, {
+        x: element.x + dx - minX,
+        y: element.y + dy - minY,
+      }),
+    );
+
+    globalSceneState.replaceAllElements([
+      ...globalSceneState.getAllElements(),
+      ...newElements,
+    ]);
+    history.resumeRecording();
+    this.setState({
+      selectedElementIds: newElements.reduce((map, element) => {
+        map[element.id] = true;
+        return map;
+      }, {} as any),
+    });
+  };
+
+  // Collaboration
+
+  setAppState = (obj: any) => {
+    this.setState(obj);
+  };
+
+  removePointer = (event: React.PointerEvent<HTMLElement>) => {
+    gesture.pointers.delete(event.pointerId);
+  };
+
+  createRoom = async () => {
+    window.history.pushState(
+      {},
+      "Excalidraw",
+      await generateCollaborationLink(),
+    );
+    this.initializeSocketClient();
+  };
+
+  destroyRoom = () => {
+    window.history.pushState({}, "Excalidraw", window.location.origin);
+    this.destroySocketClient();
+  };
+
+  toggleLock = () => {
+    this.setState(prevState => ({
+      elementLocked: !prevState.elementLocked,
+      elementType: prevState.elementLocked
+        ? "selection"
+        : prevState.elementType,
+    }));
   };
 
   private destroySocketClient = () => {
@@ -331,7 +748,7 @@ export class App extends React.Component<any, AppState> {
                       }
 
                       return elements;
-                    }, [] as any)
+                    }, [] as Mutable<typeof restoredState.elements>)
                     // add local elements that weren't deleted or on remote
                     .concat(...Object.values(localElementMap)),
                 );
@@ -447,131 +864,7 @@ export class App extends React.Component<any, AppState> {
     this.setState({});
   };
 
-  private unmounted = false;
-  public async componentDidMount() {
-    if (
-      process.env.NODE_ENV === "test" ||
-      process.env.NODE_ENV === "development"
-    ) {
-      const setState = this.setState.bind(this);
-      Object.defineProperties(window.h, {
-        state: {
-          configurable: true,
-          get: () => {
-            return this.state;
-          },
-        },
-        setState: {
-          configurable: true,
-          value: (...args: Parameters<typeof setState>) => {
-            return this.setState(...args);
-          },
-        },
-      });
-    }
-
-    this.removeSceneCallback = globalSceneState.addCallback(
-      this.onSceneUpdated,
-    );
-
-    document.addEventListener("copy", this.onCopy);
-    document.addEventListener("paste", this.pasteFromClipboard);
-    document.addEventListener("cut", this.onCut);
-
-    document.addEventListener("keydown", this.onKeyDown, false);
-    document.addEventListener("keyup", this.onKeyUp, { passive: true });
-    document.addEventListener("mousemove", this.updateCurrentCursorPosition);
-    window.addEventListener("resize", this.onResize, false);
-    window.addEventListener("unload", this.onUnload, false);
-    window.addEventListener("blur", this.onUnload, false);
-    window.addEventListener("dragover", this.disableEvent, false);
-    window.addEventListener("drop", this.disableEvent, false);
-
-    // Safari-only desktop pinch zoom
-    document.addEventListener(
-      "gesturestart",
-      this.onGestureStart as any,
-      false,
-    );
-    document.addEventListener(
-      "gesturechange",
-      this.onGestureChange as any,
-      false,
-    );
-    document.addEventListener("gestureend", this.onGestureEnd as any, false);
-
-    const searchParams = new URLSearchParams(window.location.search);
-    const id = searchParams.get("id");
-
-    if (id) {
-      // Backwards compatibility with legacy url format
-      const scene = await loadScene(id);
-      this.syncActionResult(scene);
-    }
-
-    const jsonMatch = window.location.hash.match(
-      /^#json=([0-9]+),([a-zA-Z0-9_-]+)$/,
-    );
-    if (jsonMatch) {
-      const scene = await loadScene(jsonMatch[1], jsonMatch[2]);
-      this.syncActionResult(scene);
-      return;
-    }
-
-    const roomMatch = getCollaborationLinkData(window.location.href);
-    if (roomMatch) {
-      this.initializeSocketClient();
-      return;
-    }
-    const scene = await loadScene(null);
-    this.syncActionResult(scene);
-
-    window.addEventListener("beforeunload", this.beforeUnload);
-  }
-
-  public componentWillUnmount() {
-    this.unmounted = true;
-    this.removeSceneCallback!();
-
-    document.removeEventListener("copy", this.onCopy);
-    document.removeEventListener("paste", this.pasteFromClipboard);
-    document.removeEventListener("cut", this.onCut);
-
-    document.removeEventListener("keydown", this.onKeyDown, false);
-    document.removeEventListener(
-      "mousemove",
-      this.updateCurrentCursorPosition,
-      false,
-    );
-    document.removeEventListener("keyup", this.onKeyUp);
-    window.removeEventListener("resize", this.onResize, false);
-    window.removeEventListener("unload", this.onUnload, false);
-    window.removeEventListener("blur", this.onUnload, false);
-    window.removeEventListener("dragover", this.disableEvent, false);
-    window.removeEventListener("drop", this.disableEvent, false);
-
-    document.removeEventListener(
-      "gesturestart",
-      this.onGestureStart as any,
-      false,
-    );
-    document.removeEventListener(
-      "gesturechange",
-      this.onGestureChange as any,
-      false,
-    );
-    document.removeEventListener("gestureend", this.onGestureEnd as any, false);
-    window.removeEventListener("beforeunload", this.beforeUnload);
-  }
-
   public state: AppState = getDefaultAppState();
-
-  private onResize = withBatchedUpdates(() => {
-    globalSceneState
-      .getAllElements()
-      .forEach(element => invalidateShapeForElement(element));
-    this.setState({});
-  });
 
   private updateCurrentCursorPosition = withBatchedUpdates(
     (event: MouseEvent) => {
@@ -579,6 +872,8 @@ export class App extends React.Component<any, AppState> {
       cursorY = event.y;
     },
   );
+
+  // Input handling
 
   private onKeyDown = withBatchedUpdates((event: KeyboardEvent) => {
     if (
@@ -635,7 +930,8 @@ export class App extends React.Component<any, AppState> {
       } else if (event.key === "q") {
         this.toggleLock();
       }
-    } else if (event.key === KEYS.SPACE && gesture.pointers.size === 0) {
+    }
+    if (event.key === KEYS.SPACE && gesture.pointers.size === 0) {
       isHoldingSpace = true;
       document.documentElement.style.cursor = CURSOR_TYPE.GRABBING;
     }
@@ -655,75 +951,6 @@ export class App extends React.Component<any, AppState> {
       isHoldingSpace = false;
     }
   });
-
-  private copyToAppClipboard = () => {
-    copyToAppClipboard(globalSceneState.getAllElements(), this.state);
-  };
-
-  private copyToClipboardAsPng = () => {
-    const selectedElements = getSelectedElements(
-      globalSceneState.getAllElements(),
-      this.state,
-    );
-    exportCanvas(
-      "clipboard",
-      selectedElements.length
-        ? selectedElements
-        : globalSceneState.getAllElements(),
-      this.state,
-      this.canvas!,
-      this.state,
-    );
-  };
-
-  private pasteFromClipboard = withBatchedUpdates(
-    async (event: ClipboardEvent | null) => {
-      // #686
-      const target = document.activeElement;
-      const elementUnderCursor = document.elementFromPoint(cursorX, cursorY);
-      if (
-        // if no ClipboardEvent supplied, assume we're pasting via contextMenu
-        //  thus these checks don't make sense
-        !event ||
-        (elementUnderCursor instanceof HTMLCanvasElement &&
-          !isWritableElement(target))
-      ) {
-        const data = await getClipboardContent(event);
-        if (data.elements) {
-          this.addElementsFromPaste(data.elements);
-        } else if (data.text) {
-          const { x, y } = viewportCoordsToSceneCoords(
-            { clientX: cursorX, clientY: cursorY },
-            this.state,
-            this.canvas,
-            window.devicePixelRatio,
-          );
-
-          const element = newTextElement({
-            x: x,
-            y: y,
-            strokeColor: this.state.currentItemStrokeColor,
-            backgroundColor: this.state.currentItemBackgroundColor,
-            fillStyle: this.state.currentItemFillStyle,
-            strokeWidth: this.state.currentItemStrokeWidth,
-            roughness: this.state.currentItemRoughness,
-            opacity: this.state.currentItemOpacity,
-            text: data.text,
-            font: this.state.currentItemFont,
-          });
-
-          globalSceneState.replaceAllElements([
-            ...globalSceneState.getAllElements(),
-            element,
-          ]);
-          this.setState({ selectedElementIds: { [element.id]: true } });
-          history.resumeRecording();
-        }
-        this.selectShapeTool("selection");
-        event?.preventDefault();
-      }
-    },
-  );
 
   private selectShapeTool(elementType: AppState["elementType"]) {
     if (!isHoldingSpace) {
@@ -757,178 +984,9 @@ export class App extends React.Component<any, AppState> {
     gesture.initialScale = null;
   });
 
-  setAppState = (obj: any) => {
-    this.setState(obj);
-  };
-
-  removePointer = (event: React.PointerEvent<HTMLElement>) => {
-    gesture.pointers.delete(event.pointerId);
-  };
-
-  createRoom = async () => {
-    window.history.pushState(
-      {},
-      "Excalidraw",
-      await generateCollaborationLink(),
-    );
-    this.initializeSocketClient();
-  };
-
-  destroyRoom = () => {
-    window.history.pushState({}, "Excalidraw", window.location.origin);
-    this.destroySocketClient();
-  };
-
-  toggleLock = () => {
-    this.setState(prevState => ({
-      elementLocked: !prevState.elementLocked,
-      elementType: prevState.elementLocked
-        ? "selection"
-        : prevState.elementType,
-    }));
-  };
-
   private setElements = (elements: readonly ExcalidrawElement[]) => {
     globalSceneState.replaceAllElements(elements);
   };
-
-  public render() {
-    const canvasDOMWidth = window.innerWidth;
-    const canvasDOMHeight = window.innerHeight;
-
-    const canvasScale = window.devicePixelRatio;
-
-    const canvasWidth = canvasDOMWidth * canvasScale;
-    const canvasHeight = canvasDOMHeight * canvasScale;
-
-    return (
-      <div className="container">
-        <LayerUI
-          canvas={this.canvas}
-          appState={this.state}
-          setAppState={this.setAppState}
-          actionManager={this.actionManager}
-          elements={globalSceneState.getAllElements()}
-          setElements={this.setElements}
-          language={getLanguage()}
-          onRoomCreate={this.createRoom}
-          onRoomDestroy={this.destroyRoom}
-          onToggleLock={this.toggleLock}
-        />
-        <main>
-          <canvas
-            id="canvas"
-            style={{
-              width: canvasDOMWidth,
-              height: canvasDOMHeight,
-            }}
-            width={canvasWidth}
-            height={canvasHeight}
-            ref={canvas => {
-              // canvas is null when unmounting
-              if (canvas !== null) {
-                this.canvas = canvas;
-                this.rc = rough.canvas(this.canvas);
-
-                this.canvas.addEventListener("wheel", this.handleWheel, {
-                  passive: false,
-                });
-              } else {
-                this.canvas?.removeEventListener("wheel", this.handleWheel);
-              }
-            }}
-            onContextMenu={event => {
-              event.preventDefault();
-
-              const { x, y } = viewportCoordsToSceneCoords(
-                event,
-                this.state,
-                this.canvas,
-                window.devicePixelRatio,
-              );
-
-              const element = getElementAtPosition(
-                globalSceneState.getAllElements(),
-                this.state,
-                x,
-                y,
-                this.state.zoom,
-              );
-              if (!element) {
-                ContextMenu.push({
-                  options: [
-                    navigator.clipboard && {
-                      label: t("labels.paste"),
-                      action: () => this.pasteFromClipboard(null),
-                    },
-                    probablySupportsClipboardBlob &&
-                      hasNonDeletedElements(
-                        globalSceneState.getAllElements(),
-                      ) && {
-                        label: t("labels.copyAsPng"),
-                        action: this.copyToClipboardAsPng,
-                      },
-                    ...this.actionManager.getContextMenuItems(action =>
-                      this.canvasOnlyActions.includes(action.name),
-                    ),
-                  ],
-                  top: event.clientY,
-                  left: event.clientX,
-                });
-                return;
-              }
-
-              if (!this.state.selectedElementIds[element.id]) {
-                this.setState({ selectedElementIds: { [element.id]: true } });
-              }
-
-              ContextMenu.push({
-                options: [
-                  navigator.clipboard && {
-                    label: t("labels.copy"),
-                    action: this.copyToAppClipboard,
-                  },
-                  navigator.clipboard && {
-                    label: t("labels.paste"),
-                    action: () => this.pasteFromClipboard(null),
-                  },
-                  probablySupportsClipboardBlob && {
-                    label: t("labels.copyAsPng"),
-                    action: this.copyToClipboardAsPng,
-                  },
-                  ...this.actionManager.getContextMenuItems(
-                    action => !this.canvasOnlyActions.includes(action.name),
-                  ),
-                ],
-                top: event.clientY,
-                left: event.clientX,
-              });
-            }}
-            onPointerDown={this.handleCanvasPointerDown}
-            onDoubleClick={this.handleCanvasDoubleClick}
-            onPointerMove={this.handleCanvasPointerMove}
-            onPointerUp={this.removePointer}
-            onPointerCancel={this.removePointer}
-            onDrop={event => {
-              const file = event.dataTransfer.files[0];
-              if (
-                file?.type === "application/json" ||
-                file?.name.endsWith(".excalidraw")
-              ) {
-                loadFromBlob(file)
-                  .then(({ elements, appState }) =>
-                    this.syncActionResult({ elements, appState }),
-                  )
-                  .catch(error => console.error(error));
-              }
-            }}
-          >
-            {t("labels.drawingCanvas")}
-          </canvas>
-        </main>
-      </div>
-    );
-  }
 
   private handleCanvasDoubleClick = (
     event: React.MouseEvent<HTMLCanvasElement>,
@@ -2252,6 +2310,74 @@ export class App extends React.Component<any, AppState> {
     window.addEventListener("pointerup", onPointerUp);
   };
 
+  private handleCanvasContextMenu = (
+    event: React.PointerEvent<HTMLCanvasElement>,
+  ) => {
+    event.preventDefault();
+
+    const { x, y } = viewportCoordsToSceneCoords(
+      event,
+      this.state,
+      this.canvas,
+      window.devicePixelRatio,
+    );
+
+    const element = getElementAtPosition(
+      globalSceneState.getAllElements(),
+      this.state,
+      x,
+      y,
+      this.state.zoom,
+    );
+    if (!element) {
+      ContextMenu.push({
+        options: [
+          navigator.clipboard && {
+            label: t("labels.paste"),
+            action: () => this.pasteFromClipboard(null),
+          },
+          probablySupportsClipboardBlob &&
+            hasNonDeletedElements(globalSceneState.getAllElements()) && {
+              label: t("labels.copyAsPng"),
+              action: this.copyToClipboardAsPng,
+            },
+          ...this.actionManager.getContextMenuItems(action =>
+            this.canvasOnlyActions.includes(action.name),
+          ),
+        ],
+        top: event.clientY,
+        left: event.clientX,
+      });
+      return;
+    }
+
+    if (!this.state.selectedElementIds[element.id]) {
+      this.setState({ selectedElementIds: { [element.id]: true } });
+    }
+
+    ContextMenu.push({
+      options: [
+        navigator.clipboard && {
+          label: t("labels.copy"),
+          action: this.copyToAppClipboard,
+        },
+        navigator.clipboard && {
+          label: t("labels.paste"),
+          action: () => this.pasteFromClipboard(null),
+        },
+        probablySupportsClipboardBlob && {
+          label: t("labels.copyAsPng"),
+          action: this.copyToClipboardAsPng,
+        },
+        ...this.actionManager.getContextMenuItems(
+          action => !this.canvasOnlyActions.includes(action.name),
+        ),
+      ],
+      top: event.clientY,
+      left: event.clientX,
+    });
+  };
+
   private handleWheel = withBatchedUpdates((event: WheelEvent) => {
     event.preventDefault();
     const { deltaX, deltaY } = event;
@@ -2276,55 +2402,6 @@ export class App extends React.Component<any, AppState> {
       scrollY: normalizeScroll(scrollY - deltaY / zoom),
     }));
   });
-
-  private beforeUnload = withBatchedUpdates((event: BeforeUnloadEvent) => {
-    if (
-      this.state.isCollaborating &&
-      hasNonDeletedElements(globalSceneState.getAllElements())
-    ) {
-      event.preventDefault();
-      // NOTE: modern browsers no longer allow showing a custom message here
-      event.returnValue = "";
-    }
-  });
-
-  private addElementsFromPaste = (
-    clipboardElements: readonly ExcalidrawElement[],
-  ) => {
-    const [minX, minY, maxX, maxY] = getCommonBounds(clipboardElements);
-
-    const elementsCenterX = distance(minX, maxX) / 2;
-    const elementsCenterY = distance(minY, maxY) / 2;
-
-    const { x, y } = viewportCoordsToSceneCoords(
-      { clientX: cursorX, clientY: cursorY },
-      this.state,
-      this.canvas,
-      window.devicePixelRatio,
-    );
-
-    const dx = x - elementsCenterX;
-    const dy = y - elementsCenterY;
-
-    const newElements = clipboardElements.map(element =>
-      duplicateElement(element, {
-        x: element.x + dx - minX,
-        y: element.y + dy - minY,
-      }),
-    );
-
-    globalSceneState.replaceAllElements([
-      ...globalSceneState.getAllElements(),
-      ...newElements,
-    ]);
-    history.resumeRecording();
-    this.setState({
-      selectedElementIds: newElements.reduce((map, element) => {
-        map[element.id] = true;
-        return map;
-      }, {} as any),
-    });
-  };
 
   private getTextWysiwygSnappedToCenterPosition(x: number, y: number) {
     const elementClickedInside = getElementContainingPosition(
@@ -2368,69 +2445,6 @@ export class App extends React.Component<any, AppState> {
   private saveDebounced = debounce(() => {
     saveToLocalStorage(globalSceneState.getAllElements(), this.state);
   }, 300);
-
-  componentDidUpdate() {
-    if (this.state.isCollaborating && !this.socket) {
-      this.initializeSocketClient();
-    }
-    const pointerViewportCoords: {
-      [id: string]: { x: number; y: number };
-    } = {};
-    this.state.collaborators.forEach((user, socketID) => {
-      if (!user.pointer) {
-        return;
-      }
-      pointerViewportCoords[socketID] = sceneCoordsToViewportCoords(
-        {
-          sceneX: user.pointer.x,
-          sceneY: user.pointer.y,
-        },
-        this.state,
-        this.canvas,
-        window.devicePixelRatio,
-      );
-    });
-    const { atLeastOneVisibleElement, scrollBars } = renderScene(
-      globalSceneState.getAllElements(),
-      this.state,
-      this.state.selectionElement,
-      window.devicePixelRatio,
-      this.rc!,
-      this.canvas!,
-      {
-        scrollX: this.state.scrollX,
-        scrollY: this.state.scrollY,
-        viewBackgroundColor: this.state.viewBackgroundColor,
-        zoom: this.state.zoom,
-        remotePointerViewportCoords: pointerViewportCoords,
-      },
-      {
-        renderOptimizations: true,
-      },
-    );
-    if (scrollBars) {
-      currentScrollBars = scrollBars;
-    }
-    const scrolledOutside =
-      !atLeastOneVisibleElement &&
-      hasNonDeletedElements(globalSceneState.getAllElements());
-    if (this.state.scrolledOutside !== scrolledOutside) {
-      this.setState({ scrolledOutside: scrolledOutside });
-    }
-    this.saveDebounced();
-
-    if (
-      getDrawingVersion(globalSceneState.getAllElements()) >
-      this.lastBroadcastedOrReceivedSceneVersion
-    ) {
-      this.broadcastSceneUpdate();
-    }
-
-    if (history.isRecording()) {
-      history.pushEntry(this.state, globalSceneState.getAllElements());
-      history.skipRecording();
-    }
-  }
 }
 
 // -----------------------------------------------------------------------------

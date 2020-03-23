@@ -291,8 +291,6 @@ export async function exportCanvas(
   if (!hasNonDeletedElements(elements)) {
     return window.alert(t("alerts.cannotExportEmptyCanvas"));
   }
-  // calculate smallest area to fit the contents in
-
   if (type === "svg") {
     const tempSvg = exportToSvg(elements, {
       exportBackground,
@@ -357,5 +355,6 @@ export async function loadScene(id: string | null, privateKey?: string) {
   return {
     elements: data.elements,
     appState: data.appState && { ...data.appState },
+    commitToHistory: false,
   };
 }
